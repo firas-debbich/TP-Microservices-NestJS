@@ -2,6 +2,27 @@
 
 A microservices demo built with NestJS, TypeORM, gRPC, Kafka, and GraphQL.
 
+## Why four different protocols?
+
+Each communication style solves a different problem. Using the same protocol everywhere would mean either accepting unnecessary latency, tight coupling, or a poor developer experience depending on which one you picked.
+
+**REST** is used by `catalog-service` and `order-service` because these are resource-oriented services exposed to the outside world. HTTP is universally understood, trivially consumable by browsers and CLI tools, and maps naturally to CRUD operations on entities (`POST /orders`, `GET /products/:id`). Swagger documentation comes for free.
+
+**gRPC** is used between `order-service` and `stock-service` because this call is synchronous, internal, and latency-sensitive — an order cannot be confirmed without knowing whether stock is available. gRPC uses Protocol Buffers (binary, compact) and enforces a strict typed contract via `.proto`, which prevents interface drift between services without the overhead of HTTP+JSON parsing. A REST call here would add unnecessary serialization cost and looser contracts on a hot path.
+
+**Kafka** is used between `order-service` and `notification-service` because sending a confirmation email is not part of placing an order — it is a side effect. Making `order-service` wait for the email to be sent would couple an unrelated concern to the critical path and make the order endpoint as slow as the slowest consumer. Kafka decouples them: the order is confirmed the moment it is saved and the event is published; the notification-service processes it independently, can fall behind and catch up, and can be restarted without affecting order creation.
+
+**GraphQL** is used by `query-service` because it acts as an aggregation layer over multiple REST services. Instead of forcing clients to call `catalog-service` and `order-service` separately and deal with over-fetching, GraphQL lets clients declare exactly the fields they need in a single request. The schema is introspective and self-documenting, and the mutation (`createOrder`) proxies to `order-service` so clients have a single entry point for both reads and writes.
+
+| Protocol | Interaction style | Why it fits here |
+|----------|-------------------|------------------|
+| REST     | Synchronous, request/response | External-facing CRUD, tooling ecosystem, HTTP semantics |
+| gRPC     | Synchronous, request/response | Internal, typed contract, binary efficiency on a critical path |
+| Kafka    | Asynchronous, event-driven    | Fire-and-forget side effect, decouples services, consumer resilience |
+| GraphQL  | Synchronous, client-driven    | Aggregates multiple sources, avoids over-fetching, single API surface |
+
+---
+
 ## Architecture
 
 ```
@@ -101,6 +122,8 @@ REST API for managing products. Swagger UI at `http://localhost:3001/api`.
 
 REST API for orders. Swagger UI at `http://localhost:3002/api`.
 
+![Order Service Swagger](screenShot/image%20copy%207.png)
+
 On `POST /orders` the service: (1) calls stock-service via gRPC to check and reserve stock, (2) saves the order to PostgreSQL, (3) publishes an `order.created` event to Kafka.
 
 | Method | Path          | Body                                  | Description        |
@@ -156,6 +179,8 @@ curl http://localhost:3001/products
 
 Expected: array of 4 products — Laptop Pro, Mechanical Keyboard, USB-C Hub, Monitor 4K.
 
+![GET /products — list all](screenShot/image%20copy.png)
+
 ---
 
 ### 2. Create a product
@@ -163,10 +188,12 @@ Expected: array of 4 products — Laptop Pro, Mechanical Keyboard, USB-C Hub, Mo
 ```bash
 curl -X POST http://localhost:3001/products \
   -H "Content-Type: application/json" \
-  -d '{"name": "Wireless Mouse", "price": 35, "stock": 100}'
+  -d '{"name": "Mechanical Keyboard", "price": 150, "stock": 5}'
 ```
 
 Expected: `201` with the created product object including `id`.
+
+![POST /products — 201 Created](screenShot/image.png)
 
 ---
 
@@ -175,10 +202,12 @@ Expected: `201` with the created product object including `id`.
 ```bash
 curl -X PATCH http://localhost:3001/products/1 \
   -H "Content-Type: application/json" \
-  -d '{"price": 999}'
+  -d '{"price": 99}'
 ```
 
 Expected: `200` with the updated product.
+
+![PATCH /products/1 — price updated](screenShot/image%20copy%202.png)
 
 ---
 
@@ -187,59 +216,99 @@ Expected: `200` with the updated product.
 ```bash
 curl -X POST http://localhost:3002/orders \
   -H "Content-Type: application/json" \
-  -d '{"productId": 1, "quantity": 2, "customerEmail": "client@test.com"}'
+  -d '{"productId": 1, "quantity": 2, "customerEmail": "alice@test.com"}'
 ```
 
-Expected: `201` with the order. Check `notification-service` logs — you should see the Kafka event and simulated email printed.
+Expected: `201` with `status: "CONFIRMED"`. Check `notification-service` logs — you should see the Kafka event and simulated email printed.
+
+![POST /orders — 201 CONFIRMED](screenShot/image%20copy%203.png)
 
 ---
 
-### 5. Place an order with insufficient stock
+### 5. List all orders
 
 ```bash
-# Laptop Pro has stock of 10; request 999
+curl http://localhost:3002/orders
+```
+
+Expected: `200` with the full list of confirmed orders.
+
+![GET /orders — list all](screenShot/image%20copy%206.png)
+
+---
+
+### 6. Place an order with insufficient stock
+
+```bash
 curl -X POST http://localhost:3002/orders \
   -H "Content-Type: application/json" \
-  -d '{"productId": 1, "quantity": 999, "customerEmail": "client@test.com"}'
+  -d '{"productId": 1, "quantity": 9999, "customerEmail": "fail@test.com"}'
 ```
 
-Expected: `409 Conflict` — gRPC check fails before the order is saved.
+Expected: `409 Conflict` — gRPC check fails before the order is saved. Response includes `remainingStock`.
+
+![POST /orders — 409 Conflict](screenShot/image%20copy%204.png)
 
 ---
 
-### 6. Query products via GraphQL
+### 7. Validation error — invalid order fields
 
 ```bash
-curl -X POST http://localhost:3003/graphql \
+curl -X POST http://localhost:3002/orders \
   -H "Content-Type: application/json" \
-  -d '{"query":"{ products { id name price stock } }"}'
+  -d '{"productId": 1, "quantity": -5, "customerEmail": "notanemail"}'
 ```
+
+Expected: `400 Bad Request` listing all failing constraints (`quantity must be a positive number`, `customerEmail must be an email`).
+
+![POST /orders — 400 Bad Request](screenShot/image%20copy%205.png)
 
 ---
 
-### 7. Create an order via GraphQL mutation
+### 8. GraphQL — query products and orders
 
-```bash
-curl -X POST http://localhost:3003/graphql \
-  -H "Content-Type: application/json" \
-  -d '{
-    "query": "mutation { createOrder(input: { productId: 2, quantity: 1, customerEmail: \"test@example.com\" }) { id status } }"
-  }'
+Open the playground at `http://localhost:3003/graphql` or run:
+
+```graphql
+query {
+  products { id name price stock }
+  orders { id customerEmail status quantity }
+}
 ```
 
-Expected: order object with `status: "CONFIRMED"`.
+Both resource types are returned in a single round-trip — no second HTTP call needed.
+
+![GraphQL — products + orders combined query](screenShot/image%20copy%2010.png)
 
 ---
 
-### 8. Validation error — missing field
+### 9. GraphQL — query a single product by ID
 
-```bash
-curl -X POST http://localhost:3001/products \
-  -H "Content-Type: application/json" \
-  -d '{"name": "Incomplete"}'
+```graphql
+query {
+  productById(id: "1") { price name stock }
+}
 ```
 
-Expected: `400 Bad Request` with validation error details for `price` and `stock`.
+Only the requested fields are returned — no over-fetching.
+
+![GraphQL — productById](screenShot/image%20copy%209.png)
+
+---
+
+### 10. GraphQL — createOrder mutation
+
+```graphql
+mutation {
+  createOrder(input: { productId: 1, quantity: 1, customerEmail: "graphql@test.com" }) {
+    id status customerEmail
+  }
+}
+```
+
+Expected: order object with `status: "CONFIRMED"`. Internally the mutation proxies to `order-service` via HTTP, which in turn calls `stock-service` via gRPC and publishes to Kafka.
+
+![GraphQL mutation — createOrder CONFIRMED](screenShot/image%20copy%208.png)
 
 ---
 
